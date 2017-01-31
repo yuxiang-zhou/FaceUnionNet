@@ -354,3 +354,142 @@ class ProtobuffProvider(object):
         self._set_shape(image, pose, gt_heatmap, gt_lms)
 
         return image, pose, gt_heatmap, gt_lms, scale
+
+
+class CatFaceProvider(ProtobuffProvider):
+    def __init__(self, filename='data.tfrecords', root=None,
+                 batch_size=1, rescale=None, augmentation=False):
+
+        super().__init__(
+            filename,
+            root,
+            batch_size=batch_size,
+            rescale=rescale,
+            augmentation=augmentation)
+
+    def _set_shape(self, image, pose, gt_heatmap, gt_lms):
+        image.set_shape([None, None, 3])
+        gt_heatmap.set_shape([None, None, 38])
+        gt_lms.set_shape([38, 2])
+
+    def _get_features(self, serialized_example):
+        features = tf.parse_single_example(
+            serialized_example,
+            features={
+                # images
+                'image': tf.FixedLenFeature([], tf.string),
+                'height': tf.FixedLenFeature([], tf.int64),
+                'width': tf.FixedLenFeature([], tf.int64),
+                # landmarks
+                'n_landmarks': tf.FixedLenFeature([], tf.int64),
+                'gt': tf.FixedLenFeature([], tf.string),
+                'scale': tf.FixedLenFeature([], tf.float32),
+                # original infomations
+                'original_scale': tf.FixedLenFeature([], tf.float32),
+                'original_centre': tf.FixedLenFeature([], tf.string),
+                'original_lms': tf.FixedLenFeature([], tf.string),
+                # inverse transform to original landmarks
+                'restore_translation': tf.FixedLenFeature([], tf.string),
+                'restore_scale': tf.FixedLenFeature([], tf.float32)
+            }
+
+        )
+        return features
+
+    def _heatmap_from_feature(self, features):
+        n_landmarks = tf.to_int32(features['n_landmarks'])
+        gt_lms = tf.decode_raw(features['gt'], tf.float32)
+        visible = tf.range(n_landmarks)
+        marked = tf.range(n_landmarks)
+        image_height = tf.to_int32(features['height'])
+        image_width = tf.to_int32(features['width'])
+
+        gt_lms = tf.reshape(gt_lms, (n_landmarks, 2))
+        gt_heatmap = lms_to_heatmap(
+            gt_lms, image_height, image_width, n_landmarks, marked)
+        gt_heatmap = tf.transpose(gt_heatmap, perm=[1,2,0])
+
+        return gt_heatmap, gt_lms, n_landmarks, visible, marked
+
+    def _get_data_protobuff(self, filename):
+        filename = str(filename)
+        filename_queue = tf.train.string_input_producer([filename],
+                                                        num_epochs=None)
+        reader = tf.TFRecordReader()
+        _, serialized_example = reader.read(filename_queue)
+        features = self._get_features(serialized_example)
+
+        # image
+        image, image_height, image_width = self._image_from_feature(features)
+
+        # landmarks
+        gt_heatmap, gt_lms, n_landmarks, visible, marked = self._heatmap_from_feature(features)
+
+        # infomations
+        scale = self._info_from_feature(features)
+
+        # augmentation
+        if self.augmentation:
+            do_flip, do_rotate, do_scale = tf.unpack(self.augmentation_type())
+
+            # rescale
+            image_height = tf.to_int32(tf.to_float(image_height) * do_scale[0])
+            image_width = tf.to_int32(tf.to_float(image_width) * do_scale[0])
+
+            image = tf.image.resize_images(image, tf.pack([image_height, image_width]))
+            gt_heatmap = tf.image.resize_images(gt_heatmap, tf.pack([image_height, image_width]))
+            gt_lms *= do_scale
+
+
+            # rotate
+            image = rotate_image_tensor(image, do_rotate)
+            gt_heatmap = rotate_image_tensor(gt_heatmap, do_rotate)
+            gt_lms = rotate_points_tensor(gt_lms, image, do_rotate)
+
+
+            # flip
+            def flip_fn(image=image, gt_heatmap=gt_heatmap, gt_lms=gt_lms):
+                image = tf.image.flip_left_right(image)
+                gt_heatmap = tf.image.flip_left_right(gt_heatmap)
+
+
+                flip_hm_list = []
+                flip_lms_list = []
+                for idx in [
+                    2,1,0,4,3,
+                    7,6,5,
+                    8,9,10,11,
+                    18,19,20,21,22,23,
+                    12,13,14,15,16,17,
+                    31,32,33,34,35,36,37,
+                    24,25,26,27,28,29,30]:
+                    flip_hm_list.append(gt_heatmap[:,:,idx])
+                    flip_lms_list.append(gt_lms[idx,:])
+
+                gt_heatmap = tf.pack(flip_hm_list, axis=2)
+                gt_lms = tf.pack(flip_lms_list)
+
+                return image, gt_heatmap, gt_lms
+
+            def no_flip(image=image, gt_heatmap=gt_heatmap, gt_lms=gt_lms):
+                return image, gt_heatmap, gt_lms
+
+            image, gt_heatmap, gt_lms = tf.cond(do_flip[0] > 0.5, flip_fn, no_flip)
+
+        # crop to 256 * 256
+        target_h = tf.to_int32(256)
+        target_w = tf.to_int32(256)
+        offset_h = tf.to_int32((image_height - target_h) / 2)
+        offset_w = tf.to_int32((image_width - target_w) / 2)
+
+        image = tf.image.crop_to_bounding_box(
+            image, offset_h, offset_w, target_h, target_w)
+
+        gt_heatmap = tf.image.crop_to_bounding_box(
+            gt_heatmap, offset_h, offset_w, target_h, target_w)
+
+        gt_lms -= tf.to_float(tf.pack([offset_h, offset_w]))
+
+        self._set_shape(image, None, gt_heatmap, gt_lms)
+
+        return image, gt_heatmap, gt_lms, scale

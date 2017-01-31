@@ -239,92 +239,17 @@ class DeepNetwork(object):
 
 
 
-# Multiscale SVS + Landmark Regression Framework
-
-class DNSVS(DeepNetwork):
-    """docstring for DNSVSHourglass"""
-    def __init__(self, output_svs=7, output_lms=16):
-
-        super(DNSVS, self).__init__(output_lms=output_lms)
-
-        self.output_svs = output_svs
-
-    def _get_data(self):
-        image, pose, gt_heatmap, gt_lms, scale = super(
-            DNSVS, self)._get_data()
-
-        return image, pose, gt_heatmap, gt_lms, scale
+class DNCatFace(DeepNetwork):
+    """docstring for DeepNetwork"""
+    def __init__(self, path, output_lms=FLAGS.n_landmarks):
+        super(DNCatFace, self).__init__(output_lms=output_lms)
+        self.network_path = path
 
     def _build_network(self, inputs):
-        pass
-
-    def _build_losses(self, predictions, states, images, datas):
-        pose, gt_heatmap, *_ = datas
-        # Add a cosine loss to every scale and the combined output.
-        for i, state in enumerate(states):
-            gt = pose[:, i, :, :, :]
-
-            ones = tf.ones_like(gt)
-            weights = tf.select(gt < .1, ones, ones * 100)
-
-            loss = losses.smooth_l1(state, gt, weights)
-            tf.scalar_summary('losses/iteration_{}'.format(i), loss)
-
-        # landmark-regression losses
-        weight_hm = utils.get_weight(gt_heatmap, ng_w=0.1, ps_w=1) * 500
-        l2norm = slim.losses.mean_squared_error(predictions, gt_heatmap, weight=weight_hm)
-        tf.scalar_summary('losses/lms_pred', l2norm)
-
-    def _build_summaries(self, predictions, states, images, datas):
-        pose, gt_heatmap, *_ = datas
-
-        batch_summariy = tf.concat(1, [
-            tf.reduce_sum(images, -1)[...,None],
-            tf.reduce_sum(predictions, -1)[...,None],
-            tf.reduce_sum(gt_heatmap, -1)[...,None]
-        ])
-
-        tf.image_summary('predictions/landmark-regression', tf.reduce_sum(predictions, -1)[...,None], max_images=min(FLAGS.batch_size,4))
-        tf.image_summary('gt/all ', tf.reduce_sum(gt_heatmap, -1)[...,None], max_images=min(FLAGS.batch_size,4))
-
-        for i in range(len(states)):
-            tf.image_summary('state/it_{}'.format(i), tf.reduce_sum(states[i], -1)[..., None], max_images=min(FLAGS.batch_size,4))
-            tf.image_summary('gt/it_{}'.format(i), tf.reduce_sum(pose[:, i, :, :, :], -1)[..., None], max_images=min(FLAGS.batch_size,4))
-
-            batch_summariy = tf.concat(1, [
-                batch_summariy,
-                tf.reduce_sum(states[i], -1)[..., None],
-                tf.reduce_sum(pose[:, i, :, :, :], -1)[..., None]
-            ])
-
-            for j in range(self.output_svs):
-                state = states[i][..., j][..., None]
-                gt = pose[:, i, ..., j][..., None]
-                tf.image_summary('state/it_{}/part_{}'.format(i, j),  tf.concat(1, (state, gt)), max_images=min(FLAGS.batch_size,4))
-
-
-        tf.image_summary('batch', batch_summariy, max_images=min(FLAGS.batch_size,4))
-
-
-class DNSVSHG(DNSVS):
-    """docstring for DNSVSHourglass"""
-    def __init__(self, output_svs=7, output_lms=16):
-
-        super(DNSVSHG, self).__init__(
-            output_svs=output_svs,
-            output_lms=output_lms)
-
-        self.network_path = '{}/weight.pkl'.format(FLAGS.dataset_dir)
-
-    def _build_network(self, inputs, layers=[]):
 
         batch_size = tf.shape(inputs)[0]
         height = tf.shape(inputs)[1]
         width = tf.shape(inputs)[2]
-
-        states = []
-        hidden = tf.zeros(
-            (batch_size, height, width, self.output_svs), name='hidden')
 
         with open(self.network_path, 'br') as f:
             data = pickle.load(f, encoding='latin1')
@@ -333,46 +258,54 @@ class DNSVSHG(DNSVS):
         subnet_regression['children'][-2]['children'].pop()
         subnet_regression['children'].pop()
 
-
-        for i in range(FLAGS.num_iterations):
-            with tf.variable_scope('multiscale', reuse=i > 0):
-                hidden = tf.concat(3, (inputs, hidden))
-                hidden = slim.conv2d(
-                    hidden,
-                    19,
-                    1,
-                    activation_fn=None
-                )
-
-                hidden = utils.build_graph(hidden, subnet_regression)
-
-                hidden = slim.conv2d(
-                    hidden,
-                    self.output_svs,
-                    1,
-                    activation_fn=None
-                )
-                hidden = slim.conv2d_transpose(
-                    hidden,
-                    self.output_svs,
-                    4,
-                    4,
-                    activation_fn=None,
-                    padding='VALID'
-                )
-                states.append(hidden)
-
-        net = tf.concat(3, (inputs, hidden))
         net = slim.conv2d(
-            net,
-            19,
+            inputs,
+            self.output_lms + 3,
             1,
             activation_fn=None
         )
 
-        with open(self.network_path, 'br') as f:
-            data2 = pickle.load(f, encoding='latin1')
-        prediction = utils.build_graph(net,  data2['children'][2])
+        net = utils.build_graph(net, subnet_regression)
 
-        layers.append(data2)
-        return prediction, states
+        net = slim.conv2d(
+            net,
+            self.output_lms,
+            1,
+            activation_fn=None
+        )
+        net = slim.conv2d_transpose(
+            net,
+            self.output_lms,
+            4,
+            4,
+            activation_fn=None,
+            padding='VALID'
+        )
+
+        return net, []
+
+    def _build_losses(self, predictions, states, images, datas):
+        heatmap, *_ = datas
+
+        # landmark-regression losses
+        weight_hm = utils.get_weight(heatmap, tf.ones_like(heatmap), ng_w=0.1, ps_w=1) * 500
+        l2norm = slim.losses.mean_squared_error(predictions, heatmap, weight=weight_hm)
+        tf.scalar_summary('losses/lms_pred', l2norm)
+
+    def _build_summaries(self, predictions, states, images, datas):
+        heatmap, *_ = datas
+
+        tf.image_summary('predictions/landmark-regression', tf.reduce_sum(predictions, -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
+        # tf.image_summary('gt/all ', tf.reduce_sum(heatmap * tf.ones(heatmap), -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
+
+    def _get_data(self):
+        provider = data_provider.CatFaceProvider(
+            root=FLAGS.dataset_dir,
+            batch_size=FLAGS.batch_size,
+            rescale=FLAGS.rescale,
+            augmentation=FLAGS.eval_dir=='',
+            )
+
+        image, gt_heatmap, gt_lms, scale = provider.get()
+
+        return image, gt_heatmap, gt_lms, scale

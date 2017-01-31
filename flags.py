@@ -19,8 +19,8 @@ tf.app.flags.DEFINE_integer('eval_size', 500, '''The batch size to use.''')
 tf.app.flags.DEFINE_integer('num_iterations', 2, '''The number of iterations to unfold the pose machine.''')
 tf.app.flags.DEFINE_integer('num_preprocess_threads', 4,
                             '''How many preprocess threads to use.''')
-tf.app.flags.DEFINE_integer('n_landmarks', 16,
-                            '''training mode''')
+tf.app.flags.DEFINE_integer('n_landmarks', 38,
+                            '''number of landmarks''')
 tf.app.flags.DEFINE_integer('rescale', 256,
                             '''training mode''')
 
@@ -29,7 +29,7 @@ tf.app.flags.DEFINE_string('train_model', '',
 tf.app.flags.DEFINE_string('dataset_dir', '/vol/atlas/databases/body/SupportVectorBody/crop340-mpii-train/',
                            '''Directory where to load datas '''
                            '''and checkpoint.''')
-tf.app.flags.DEFINE_string('train_dir', 'ckpt/train_svs',
+tf.app.flags.DEFINE_string('train_dir', 'ckpt/train',
                            '''Directory where to write event logs '''
                            '''and checkpoint.''')
 tf.app.flags.DEFINE_string('eval_dir', '',
