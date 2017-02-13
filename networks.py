@@ -163,7 +163,7 @@ class DeepNetwork(object):
 
                     # image summaries
                     self._build_summaries(predictions, states, images, datas)
-                    tf.image_summary('images', images, max_images=min(FLAGS.batch_size,4))
+                    tf.image_summary('images', images[:,:,:,:3], max_images=min(FLAGS.batch_size,4))
 
                     # learning rate decay
                     global_step = slim.get_or_create_global_step()
@@ -239,10 +239,10 @@ class DeepNetwork(object):
 
 
 
-class DNCatFace(DeepNetwork):
+class DNFace(DeepNetwork):
     """docstring for DeepNetwork"""
     def __init__(self, path, output_lms=FLAGS.n_landmarks):
-        super(DNCatFace, self).__init__(output_lms=output_lms)
+        super(DNFace, self).__init__(output_lms=output_lms)
         self.network_path = path
 
     def _build_network(self, inputs):
@@ -251,6 +251,8 @@ class DNCatFace(DeepNetwork):
         height = tf.shape(inputs)[1]
         width = tf.shape(inputs)[2]
 
+        states = []
+
         with open(self.network_path, 'br') as f:
             data = pickle.load(f, encoding='latin1')
 
@@ -258,9 +260,11 @@ class DNCatFace(DeepNetwork):
         subnet_regression['children'][-2]['children'].pop()
         subnet_regression['children'].pop()
 
+
+        # input + 5 -> 19
         net = slim.conv2d(
             inputs,
-            self.output_lms + 3,
+            19 + 3,
             1,
             activation_fn=None
         )
@@ -269,43 +273,136 @@ class DNCatFace(DeepNetwork):
 
         net = slim.conv2d(
             net,
-            self.output_lms,
+            19,
             1,
             activation_fn=None
         )
         net = slim.conv2d_transpose(
             net,
-            self.output_lms,
+            19,
             4,
             4,
             activation_fn=None,
             padding='VALID'
         )
+        states.append(net)
 
-        return net, []
+        # input + 19 -> 38
+        net1 = slim.conv2d(
+            tf.concat(3,[inputs,net]),
+            39 + 3,
+            1,
+            activation_fn=None
+        )
+
+        net1 = utils.build_graph(net1, subnet_regression)
+
+        net1 = slim.conv2d(
+            net1,
+            39,
+            1,
+            activation_fn=None
+        )
+        net1 = slim.conv2d_transpose(
+            net1,
+            39,
+            4,
+            4,
+            activation_fn=None,
+            padding='VALID'
+        )
+        states.append(net1)
+
+        # input + 19 -> 68
+        net2 = slim.conv2d(
+            tf.concat(3,[inputs,net]),
+            68 + 3,
+            1,
+            activation_fn=None
+        )
+
+        net2 = utils.build_graph(net2, subnet_regression)
+
+        net2 = slim.conv2d(
+            net2,
+            68,
+            1,
+            activation_fn=None
+        )
+        net2 = slim.conv2d_transpose(
+            net2,
+            68,
+            4,
+            4,
+            activation_fn=None,
+            padding='VALID'
+        )
+        states.append(net2)
+
+        return net, states
 
     def _build_losses(self, predictions, states, images, datas):
-        heatmap, *_ = datas
 
-        # landmark-regression losses
-        weight_hm = utils.get_weight(heatmap, tf.ones_like(heatmap), ng_w=0.1, ps_w=1) * 500
-        l2norm = slim.losses.mean_squared_error(predictions, heatmap, weight=weight_hm)
-        tf.scalar_summary('losses/lms_pred', l2norm)
+
+        n_landmarks, heatmap68,heatmap5,heatmap19, *_, = datas
+        heatmap39 = heatmap68
+        pred19, pred39, pred68 = states
+        batch_size = tf.shape(n_landmarks)[0]
+
+        # landmark-regression-19 losses
+        weight_hm19 = utils.get_weight(heatmap19, tf.ones_like(heatmap19), ng_w=0.1, ps_w=1) * 500
+        l2norm19 = slim.losses.mean_squared_error(pred19, heatmap19, weight=weight_hm19)
+        tf.scalar_summary('losses/lms_pred_19', l2norm19)
+
+
+        selection_mask68 = tf.select(
+            tf.equal(n_landmarks[...,None,None,None]*tf.ones((batch_size, 68,256,256), dtype=tf.int32),68),
+            tf.ones((batch_size, 68,256,256)), tf.zeros((batch_size, 68, 256, 256))
+        )
+        selection_mask68 = tf.transpose(selection_mask68, perm=[0,2,3,1])
+
+        selection_mask39 = tf.select(
+            tf.equal(n_landmarks[...,None,None,None]*tf.ones((batch_size, 68,256,256), dtype=tf.int32),39),
+            tf.concat(1,[tf.ones((batch_size, 39,256,256)),tf.zeros((batch_size, 29,256,256))]), tf.zeros((batch_size, 68,256,256))
+        )
+        selection_mask39 = tf.transpose(selection_mask39, perm=[0,2,3,1])
+
+        # landmark-regression-68 losses
+        weight_hm68 = utils.get_weight(heatmap68, tf.ones_like(heatmap68), ng_w=0.1, ps_w=1) * 500
+        weight_hm68 *= selection_mask68
+        l2norm68 = slim.losses.mean_squared_error(pred68, heatmap68, weight=weight_hm68)
+        tf.scalar_summary('losses/lms_pred_68', l2norm68)
+
+        # landmark-regression-39 losses
+        weight_hm39 = utils.get_weight(heatmap39, tf.ones_like(heatmap39), ng_w=0.1, ps_w=1) * 500
+        weight_hm39 *= selection_mask39
+
+        heatmap39 = tf.transpose(
+            tf.gather(
+                tf.transpose(heatmap39,perm=[3,0,1,2]), tf.range(39)
+            ), perm=[1,2,3,0])
+        weight_hm39 =tf.transpose(
+            tf.gather(
+                tf.transpose(weight_hm39,perm=[3,0,1,2]), tf.range(39)
+            ), perm=[1,2,3,0])
+
+        l2norm39 = slim.losses.mean_squared_error(pred39, heatmap39, weight=weight_hm39)
+        tf.scalar_summary('losses/lms_pred_39', l2norm39)
 
     def _build_summaries(self, predictions, states, images, datas):
-        heatmap, *_ = datas
+        heatmap,heatmap5,heatmap19, *_ = datas
+        pred19, pred39, pred68 = states
 
-        tf.image_summary('predictions/landmark-regression', tf.reduce_sum(predictions, -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
-        # tf.image_summary('gt/all ', tf.reduce_sum(heatmap * tf.ones(heatmap), -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
+        tf.image_summary('predictions/landmark-regression-19', tf.reduce_sum(pred19, -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
+        tf.image_summary('predictions/landmark-regression-39', tf.reduce_sum(pred39, -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
+        tf.image_summary('predictions/landmark-regression-68', tf.reduce_sum(pred68, -1)[...,None] * 255.0, max_images=min(FLAGS.batch_size,4))
 
     def _get_data(self):
-        provider = data_provider.CatFaceProvider(
+        provider = data_provider.ProtobuffProvider(
             root=FLAGS.dataset_dir,
             batch_size=FLAGS.batch_size,
             rescale=FLAGS.rescale,
             augmentation=FLAGS.eval_dir=='',
             )
 
-        image, gt_heatmap, gt_lms, scale = provider.get()
-
-        return image, gt_heatmap, gt_lms, scale
+        return provider.get()
