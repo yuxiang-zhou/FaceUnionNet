@@ -19,11 +19,8 @@ MOVING_AVERAGE_DECAY = 0.9999
 
 
 def get_model(netname):
-    if netname == 'face1968':
-        return networks.DNFace1968('saved/weight.pkl')
-
-    if netname == 'face1939':
-        return networks.DNFace1939('saved/weight.pkl')
+    if netname == 'face':
+        return networks.DNFaceMultiView('saved/weight.pkl')
 
 if __name__ == '__main__':
     while True:

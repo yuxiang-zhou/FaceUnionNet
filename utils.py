@@ -50,7 +50,7 @@ def generate_landmarks(keypoints):
     ones = tf.to_float(tf.ones_like(is_background))
     zeros = tf.to_float(tf.zeros_like(is_background))
 
-    return tf.select(is_background, zeros, ones) * 255
+    return tf.where(is_background, zeros, ones) * 255
 
 
 def project_landmarks_to_shape_model(landmarks):
@@ -301,7 +301,209 @@ def draw_landmarks(img, lms):
 def batch_draw_landmarks(imgs, lms):
     return np.array([draw_landmarks(img, l) for img, l in zip(imgs, lms)])
 
+def build_from_caffe(inputs, prototxt_path):
+    def prototxt_parser(prototxt_path):
 
+        storage_stack = [[]]
+        with open(prototxt_path,'r') as f:
+            for line in f.readlines():
+
+                line = line.strip()
+                if '{' in line:
+                    name, _ = line.split('{')
+                    storage_stack.append(name.strip().replace('"',''))
+                    storage_stack.append([])
+
+                if ':' in line:
+                    key,value = line.split(':')
+                    storage_stack[-1].append((key.strip().replace('"',''), value.strip().replace('"','')))
+
+                if '}' in line:
+                    data = storage_stack.pop()
+                    name = storage_stack.pop()
+                    storage_stack[-1].append({name.strip().replace('"',''): data})
+
+        return storage_stack[0]
+
+    def parse_token(token):
+        token_dict = {}
+
+        def safe_add_dict(k,v):
+            for type_fn in [int,float]:
+                try:
+                    v = type_fn(v)
+                    break
+                except:
+                    pass
+
+
+            if k in token_dict:
+                if type(token_dict[k]) == list:
+                    token_dict[k].append(v)
+                else:
+                    tv = token_dict[k]
+                    token_dict[k] = [tv,v]
+            else:
+                token_dict[k] = v
+
+        if type(token) == dict:
+            for k in token:
+                safe_add_dict(k, parse_token(token[k]))
+
+        elif type(token) == list:
+            for t in token:
+                ptoken = parse_token(t)
+                for k in ptoken:
+                    safe_add_dict(k, ptoken[k])
+
+        elif type(token) == tuple:
+            k,v = token
+            safe_add_dict(k, v)
+
+        else:
+            return token
+
+        return token_dict
+
+    token = prototxt_parser(prototxt_path)
+    net = inputs
+
+    lookup={
+        'data':net
+    }
+
+    for t in token[5:]:
+        node = parse_token(t)['layer']
+        if node['type'] == 'BatchNorm':
+            net = lookup[node['bottom']]
+            net = slim.batch_norm(net, scale=True)
+        elif node['type'] == 'Convolution':
+            num_output = node['convolution_param']['num_output']
+            kernel_size = node['convolution_param']['kernel_size']
+            pad = node['convolution_param']['pad'] if 'pad' in node['convolution_param'] else 0
+            stride = node['convolution_param']['stride'] if 'stride' in node['convolution_param'] else 1
+
+            net = lookup[node['bottom']]
+            net = tf.pad(
+                    net, [
+                        [0,0],
+                        [pad,pad],
+                        [pad,pad],
+                        [0,0]
+                    ])
+
+            net = slim.conv2d(
+                net,
+                num_output,
+                kernel_size,
+                stride,
+                activation_fn=None,
+                padding='VALID'
+            )
+
+        elif node['type'] == 'Pooling':
+            kernel_size = node['pooling_param']['kernel_size']
+            pad = node['pooling_param']['pad']
+            stride = node['pooling_param']['stride']
+
+            net = lookup[node['bottom']]
+            net = slim.max_pool2d(
+                 tf.pad(
+                    net, [
+                        [0,0],
+                        [pad,pad],
+                        [pad,pad],
+                        [0,0]
+                    ]),
+                kernel_size,
+                stride
+            )
+
+        elif node['type'] == 'Power':
+            power = node['power_param']['power']
+            scale = node['power_param']['scale']
+            shift = node['power_param']['shift']
+
+            net = lookup[node['bottom']]
+            net = tf.pow(shift + scale * net, power)
+
+        elif node['type'] == 'Scale':
+            net = lookup[node['bottom']]
+
+        elif node['type'] == 'Interp':
+            zoom_factor = node['interp_param']['zoom_factor']
+            pad_beg = node['interp_param']['pad_beg']
+            pad_end = node['interp_param']['pad_end']
+
+            net = lookup[node['bottom']]
+
+            net = tf.pad(
+                net, [
+                    [0,0],
+                    [pad_beg,pad_beg],
+                    [pad_beg,pad_beg],
+                    [0,0]
+                ])
+
+            in_shape = tf.shape(net)
+            net = tf.image.resize_bilinear(net, [in_shape[1]*zoom_factor,in_shape[2]*zoom_factor])
+
+            net = tf.pad(
+                net, [
+                    [0,0],
+                    [pad_end,pad_end],
+                    [pad_end,pad_end],
+                    [0,0]
+                ])
+
+        elif node['type'] == 'Softmax':
+            net = lookup[node['bottom']]
+            net = slim.softmax(net)
+
+        elif node['type'] == 'ReLU':
+            net = lookup[node['bottom']]
+            net = slim.nn.relu(net)
+
+        elif node['type'] == 'Eltwise':
+            net1 = lookup[node['bottom'][0]]
+            net2 = lookup[node['bottom'][1]]
+
+            op = 1
+            if 'eltwise_param' in node:
+                if node['eltwise_param']['operation'] == 'PROD':
+                    op = 0
+
+            if op == 0:
+                net = net1 * net2
+            elif op == 1:
+                net = net1 + net2
+            else:
+                raise 'Undefined Eltwise Operation'
+
+        elif node['type'] == 'Concat':
+            net1 = lookup[node['bottom'][0]]
+            net2 = lookup[node['bottom'][1]]
+
+            axis = node['concat_param']['axis']
+
+            net = tf.concat([net1,net2],transpose[axis])
+
+        else:
+            raise 'Undefined behaviour'
+
+
+
+        if 'functions' in node:
+            for fnode in node['functions']:
+                if fnode['type'] == 'ReLU':
+                    net = slim.nn.relu(net)
+                elif fnode['type'] == 'Softmax':
+                    net = slim.nn.softmax(net)
+
+        lookup[node['top']] = net
+
+
+    return lookup
 
 def build_graph(inputs, tree, transpose=(2,3,1,0), layers=[]):
     net = inputs
@@ -317,7 +519,7 @@ def build_graph(inputs, tree, transpose=(2,3,1,0), layers=[]):
                 net_table.append(build_graph(net, tr, transpose, layers))
         net = net_table
     elif tree['name'] == 'nn.JoinTable':
-        net = tf.concat(3, net)
+        net = tf.concat(net,3)
     elif tree['name'] == 'nn.CAddTable':
         net = tf.add_n(net)
     elif tree['name'] == 'nn.SpatialConvolution':
@@ -423,100 +625,6 @@ def build_graph(inputs, tree, transpose=(2,3,1,0), layers=[]):
     return net
 
 
-def build_graph_old(inputs, tree, transpose=(2,3,1,0)):
-    net = inputs
-
-    if tree['name'] == 'nn.Sequential':
-        with tf.name_scope('nn.Sequential'):
-            for tr in tree['children']:
-                net = build_graph(net, tr, transpose, layers)
-    elif tree['name'] == 'nn.ConcatTable':
-        net_table = []
-        with tf.name_scope('nn.ConcatTable'):
-            for tr in tree['children']:
-                net_table.append(build_graph(net, tr, transpose, layers))
-        net = net_table
-    elif tree['name'] == 'nn.JoinTable':
-        net = tf.concat(3, net)
-    elif tree['name'] == 'nn.CAddTable':
-        net = tf.add_n(net)
-    elif tree['name'] == 'nn.SpatialConvolution':
-        out_channel = int(tree['nOutputPlane'])
-        kernal_shape = (int(tree['kH']),int(tree['kW']))
-        stride_shape = (int(tree['dH']),int(tree['dW']))
-        net = tf.pad(
-                net, [
-                    [0,0],
-                    [int(tree['padH']),int(tree['padH'])],
-                    [int(tree['padW']),int(tree['padW'])],
-                    [0,0]
-                ])
-        if 'weight' in tree.keys() and 'bias' in tree.keys():
-            net = slim.conv2d(net,
-                              out_channel,
-                              kernal_shape,
-                              stride_shape,
-                              activation_fn=None,
-                              padding='VALID',
-                              weights_initializer=tf.constant_initializer(tree['weight'].transpose(*transpose)),
-                              biases_initializer=tf.constant_initializer(tree['bias'])
-                             )
-        else:
-            net = slim.conv2d(net,
-                              out_channel,
-                              kernal_shape,
-                              stride_shape,
-                              activation_fn=None,
-                              padding='VALID'
-                             )
-
-        tree['tfname'] = net.name
-        tree['tfvar'] = net
-    elif tree['name'] == 'nn.SpatialFullConvolution':
-        out_channel = int(tree['nOutputPlane'])
-        kernal_shape = (int(tree['kH']),int(tree['kW']))
-        rate = np.min(int(tree['dH']),int(tree['dW']))
-        h,w = tf.shape(net)[1:3]
-        net = tf.image.resize_bilinear(net, (h,w,out_channel))
-
-        tree['tfname'] = net.name
-        tree['tfvar'] = net
-
-    elif tree['name'] == 'nn.SpatialBatchNormalization':
-        net = slim.batch_norm(net)
-        tree['tfname'] = net.name
-        tree['tfvar'] = net
-    elif tree['name'] == 'nn.ReLU':
-        net = slim.nn.relu(net)
-        tree['tfname'] = net.name
-        tree['tfvar'] = net
-    elif tree['name'] == 'nn.Sigmoid':
-        net = slim.nn.sigmoid(net)
-        tree['tfname'] = net.name
-        tree['tfvar'] = net
-    elif tree['name'] == 'nn.SpatialMaxPooling':
-        net = slim.max_pool2d(
-            tf.pad(
-                net, [
-                    [0,0],
-                    [int(tree['padH']),int(tree['padH'])],
-                    [int(tree['padW']),int(tree['padW'])],
-                    [0,0]
-                ]),
-            (int(tree['kH']),int(tree['kW'])),
-            (int(tree['dH']),int(tree['dW']))
-        )
-        tree['tfname'] = net.name
-        tree['tfvar'] = net
-    elif tree['name'] == 'nn.Identity':
-        pass
-    else:
-        raise Exception(tree['name'])
-
-    return net
-
-
-
 def keypts_encoding(keypoints, num_classes):
     keypoints = tf.to_int32(keypoints)
     keypoints = tf.reshape(keypoints, (-1,))
@@ -526,7 +634,7 @@ def keypts_encoding(keypoints, num_classes):
 def get_weight(keypoints, mask=None, ng_w=0.01, ps_w=1.0):
     is_background = tf.equal(keypoints, 0)
     ones = tf.to_float(tf.ones_like(is_background))
-    weights = tf.select(is_background, ones * ng_w, ones*ps_w)
+    weights = tf.where(is_background, ones * ng_w, ones*ps_w)
     # if mask is not None:
     #     weights *= tf.to_float(mask)
 
@@ -539,7 +647,7 @@ def ced_accuracy(t, dists):
     pts_l  = tf.transpose(tf.gather(tf.transpose(dists), [9,13,14,15,3,4,5]))
     part_pckh = (tf.to_int32(pts_r <= t) + tf.to_int32(pts_l <= t)) / 2
 
-    return tf.concat(1, [part_pckh, tf.reduce_sum(tf.to_int32(dists <= t), 1)[...,None] / tf.shape(dists)[1]])
+    return tf.concat([part_pckh, tf.reduce_sum(tf.to_int32(dists <= t), 1)[...,None] / tf.shape(dists)[1]],1)
 
 
 def pckh(preds, gts, scales):
@@ -549,6 +657,21 @@ def pckh(preds, gts, scales):
     # return pckh[-1]
     return ced_accuracy(0.5, dists)
 
+
+def atan2(y, x):
+    angle = tf.where(tf.greater(x, 0.0), tf.atan(y / x), tf.zeros_like(x))
+    angle = tf.where(tf.greater(y, 0.0), 0.5 * np.pi - tf.atan(x / y), angle)
+    angle = tf.where(tf.less(y, 0.0), -0.5 * np.pi - tf.atan(x / y), angle)
+    angle = tf.where(tf.less(x, 0.0), tf.atan(y / x) + np.pi, angle)
+    angle = tf.where(tf.logical_and(tf.equal(x, 0.0), tf.equal(y, 0.0)),
+                      np.nan * tf.zeros_like(x), angle)
+
+    indices = tf.where(tf.less(angle, 0.0))
+    updated_values = tf.gather_nd(angle, indices) + (2 * np.pi)
+    update = tf.SparseTensor(indices, updated_values, angle.get_shape())
+    update_dense = tf.sparse_tensor_to_dense(update)
+
+    return angle + update_dense
 
 
 def import_image(img_path):
